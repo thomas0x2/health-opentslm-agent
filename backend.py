@@ -46,7 +46,7 @@ def static_file(filename: str):
 
 # ---------- data load ----------
 print(f"Loading {CSV_PATH} ...")
-_df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
+_df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"], low_memory=False)
 _df = _df.set_index("timestamp").sort_index()
 print(f"Loaded {len(_df):,} rows from {_df.index[0]} to {_df.index[-1]}")
 
@@ -278,10 +278,118 @@ def events():
     })
 
 
+# ---------- sleep advice pipeline ----------
+from sleep_pipeline.config import AGENT_BACKEND, INDEX_DIR  # noqa: E402
+from sleep_pipeline.rag.retrieve import PaperRetriever  # noqa: E402
+from sleep_pipeline.opentslm_runner import warmup as opentslm_warmup, summarize_night  # noqa: E402
+from sleep_pipeline.features import extract as extract_features  # noqa: E402
+from sleep_pipeline.agent import derive_queries, gather_chunks, synthesize_advice  # noqa: E402
+
+_retriever = PaperRetriever(INDEX_DIR)
+opentslm_warmup()
+
+
+@app.get("/api/sleep_advice")
+def sleep_advice():
+    t0 = datetime.utcnow()
+    start = parse_ts(request.args.get("start"), _df.index[0].to_pydatetime())
+    end = parse_ts(request.args.get("end"), _df.index[-1].to_pydatetime())
+    tone = request.args.get("tone", "clinical")
+    if tone not in ("clinical", "coach"):
+        abort(400, "tone must be 'clinical' or 'coach'")
+    include_opentslm = request.args.get("include_opentslm", "1") in ("1", "true", "yes")
+
+    timings: dict[str, int] = {}
+
+    # Phase 1: features
+    t_feat = datetime.utcnow()
+    feats = extract_features(start, end, df=_df)
+    timings["features"] = int((datetime.utcnow() - t_feat).total_seconds() * 1000)
+    if not feats["nights"]:
+        abort(404, "No nights detected in window")
+
+    caveats: list[str] = []
+
+    # Phase 2: OpenTSLM (per night)
+    t_ts = datetime.utcnow()
+    opentslm_payload = {"per_night_summaries": [], "error": None}
+    if include_opentslm:
+        per_night = []
+        first_err = None
+        for night in feats["nights"]:
+            res = summarize_night(_df, night["bedtime"], night["wake_time"])
+            per_night.append({
+                "bedtime": night["bedtime"],
+                "summary": res["summary"],
+                "error": res["error"],
+            })
+            if res["error"] and first_err is None:
+                first_err = res["error"]
+        opentslm_payload = {"per_night_summaries": per_night, "error": first_err}
+        if first_err:
+            caveats.append("opentslm_unavailable")
+    else:
+        caveats.append("opentslm_skipped")
+    timings["opentslm"] = int((datetime.utcnow() - t_ts).total_seconds() * 1000)
+
+    # Phase 3: RAG
+    t_rag = datetime.utcnow()
+    queries = derive_queries(feats)
+    try:
+        chunks, _ = gather_chunks(_retriever, queries, k=6)
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 503
+    except Exception as e:
+        return jsonify({"error": f"RAG retrieval failed: {e}"}), 503
+    retrieved_payload = [
+        {"paper": c.paper_title, "page": c.page, "snippet": c.text[:240], "score": round(c.score, 4)}
+        for c in chunks
+    ]
+    timings["rag"] = int((datetime.utcnow() - t_rag).total_seconds() * 1000)
+
+    # Phase 4: agent
+    t_llm = datetime.utcnow()
+    try:
+        advice = synthesize_advice(
+            backend_name=AGENT_BACKEND,
+            features=feats,
+            opentslm=opentslm_payload if include_opentslm else None,
+            chunks=chunks,
+            tone=tone,
+        )
+    except Exception as e:
+        return jsonify({"error": f"agent backend ({AGENT_BACKEND}) failed: {e}"}), 503
+    timings["claude"] = int((datetime.utcnow() - t_llm).total_seconds() * 1000)
+
+    if caveats:
+        advice.setdefault("caveats", [])
+        for c in caveats:
+            if c not in advice["caveats"]:
+                advice["caveats"].append(c)
+
+    timings["total"] = int((datetime.utcnow() - t0).total_seconds() * 1000)
+
+    return jsonify({
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "agent_backend": AGENT_BACKEND,
+        "features": feats,
+        "opentslm": opentslm_payload,
+        "retrieved_papers": retrieved_payload,
+        "advice": advice,
+        "latency_ms": timings,
+    })
+
+
 @app.errorhandler(400)
 @app.errorhandler(404)
 def _err(e):
     return jsonify({"error": str(e)}), e.code
+
+
+@app.errorhandler(500)
+def _err500(e):
+    # Keep API responses JSON even on uncaught errors.
+    return jsonify({"error": f"server error: {e}"}), 500
 
 
 if __name__ == "__main__":

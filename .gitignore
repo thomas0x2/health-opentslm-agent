@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Sleep advice pipeline
+papers/
+indexes/
+.hf_cache/
