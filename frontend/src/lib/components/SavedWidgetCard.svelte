@@ -6,12 +6,14 @@
 	let displayName = $derived((widget as any).title || (widget as any).name || 'Widget');
 	let displayType = $derived((widget as any).type || (widget as any).vizType || (widget as any).description || '');
 	let displayIcon = $derived((widget as any).icon ?? 'chart');
-	let displayColor = $derived((widget as any).color ?? '--green');
+	let displayColor = $derived(((widget as any).color ?? 'green').replace(/^--/, ''));
 
 	const colorMap: Record<string, { bg: string; fg: string }> = {
-		'--green':     { bg: 'var(--green-light)',     fg: 'var(--green)' },
-		'--blue':      { bg: 'var(--blue-light)',      fg: 'var(--blue)' },
-		'--terracotta':{ bg: 'var(--terracotta-light)',fg: 'var(--terracotta)' }
+		green:      { bg: 'var(--green-light)',      fg: 'var(--green)' },
+		blue:       { bg: 'var(--blue-light)',       fg: 'var(--blue)' },
+		terracotta: { bg: 'var(--terracotta-light)', fg: 'var(--terracotta)' },
+		gold:       { bg: 'var(--gold-light)',       fg: 'var(--gold)' },
+		purple:     { bg: 'var(--purple-light)',     fg: 'var(--purple)' }
 	};
 	const c = $derived(colorMap[displayColor] ?? { bg: 'var(--bg-warm)', fg: 'var(--text-secondary)' });
 </script>

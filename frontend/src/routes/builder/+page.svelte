@@ -16,6 +16,8 @@
 	let dashboardRecords = $state<any[]>([]);
 	let addMsg = $state('');
 
+	const ACCENT_COLORS = ['green', 'terracotta', 'blue', 'gold', 'purple'];
+
 	// Preload raw data for widget previews
 	getHealthRaw().then(r => dashboardRecords = r.records).catch(() => {});
 
@@ -27,8 +29,14 @@
 		generating = true;
 		try {
 			const res = await sendAgentMessage(t);
+			console.log('[builder] agent response:', res);
 			messages = [...messages, { role: 'agent' as const, text: res.reply, widget: res.widget as Widget }];
-			if (res.widget) pendingWidget = res.widget as Widget;
+			if (res.widget) {
+				const color = ACCENT_COLORS[Math.floor(Math.random() * ACCENT_COLORS.length)];
+				const w = { ...(res.widget as Widget), color };
+				console.log('[builder] pending widget:', w);
+				pendingWidget = w;
+			}
 		} catch (e: any) {
 			messages = [...messages, { role: 'agent' as const, text: `Error: ${e.message || 'Unknown error'}` }];
 		} finally {

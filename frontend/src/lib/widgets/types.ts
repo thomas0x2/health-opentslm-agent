@@ -24,6 +24,7 @@ export interface Widget {
 	vizType: VizType;
 	computeFn: string;
 	createdAt: string;
+	color?: string;
 }
 
 export type ComputeResult = SingleValueResult | SeriesResult;

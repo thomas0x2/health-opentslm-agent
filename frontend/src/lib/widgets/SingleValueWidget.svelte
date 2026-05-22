@@ -4,19 +4,27 @@
 
 	let { widget, records }: WidgetProps = $props();
 
-	let result = $state<SingleValueResult | null>(null);
-	let error = $state('');
-
-	try {
-		const r = executeWidget(widget, records);
-		if (r.kind === 'single_value') result = r;
-		else error = `Expected single_value result, got ${r.kind}`;
-	} catch (e: any) {
-		error = e.message || String(e);
-	}
+	let execution = $derived.by(() => {
+		if (!records || records.length === 0) return { result: null as SingleValueResult | null, error: '' };
+		try {
+			const r = executeWidget(widget, records);
+			if (r.kind === 'single_value') {
+				console.log(`[Widget "${widget.title}"] value=${r.value} ${r.unit}`);
+				return { result: r as SingleValueResult, error: '' };
+			}
+			console.warn(`[Widget "${widget.title}"] wrong kind:`, r.kind);
+			return { result: null as SingleValueResult | null, error: `Expected single_value result, got ${r.kind}` };
+		} catch (e: any) {
+			console.error(`[Widget "${widget.title}"] error:`, e.message || e);
+			return { result: null as SingleValueResult | null, error: e.message || String(e) };
+		}
+	});
+	let result = $derived(execution.result);
+	let error = $derived(execution.error);
 
 	let trendSymbol = $derived(result?.trend === 'up' ? '↑' : result?.trend === 'down' ? '↓' : '→');
 	let trendColor = $derived(result?.trend === 'up' ? 'var(--green)' : result?.trend === 'down' ? '#e74c3c' : 'var(--text-tertiary)');
+	let accentColor = $derived(`var(--${widget.color ?? 'green'})`);
 </script>
 
 <div class="widget-card">
@@ -27,7 +35,7 @@
 	<div class="content">
 		{#if result}
 			<div class="value-row">
-				<span class="value">{result.value}</span>
+				<span class="value" style="color: {accentColor}">{result.value}</span>
 				<span class="unit">{result.unit}</span>
 			</div>
 			<div class="label-row">{result.label}</div>

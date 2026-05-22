@@ -8,7 +8,7 @@
 	import WeeklyBars from '$lib/components/WeeklyBars.svelte';
 	import MetricRow from '$lib/components/MetricRow.svelte';
 	import SectionLabel from '$lib/components/SectionLabel.svelte';
-	import { loadWidgets } from '$lib/storage';
+	import { loadWidgets, removeWidget } from '$lib/storage';
 	import { CHART_REGISTRY, type Widget, type HealthRecord } from '$lib/widgets';
 	import { getHealthRaw } from '$lib/api';
 	import { getLatest, getDaily, getSeries, getStatus } from '$lib/api';
@@ -276,6 +276,11 @@
 			.then(r => widgetRecords = r.records as HealthRecord[])
 			.catch(() => {});
 	});
+
+	function handleDeleteWidget(id: string) {
+		removeWidget(id);
+		savedWidgets = loadWidgets();
+	}
 </script>
 
 <AppHeader
@@ -424,7 +429,14 @@
 			{#if widget.vizType && CHART_REGISTRY[widget.vizType]}
 				{@const Comp = CHART_REGISTRY[widget.vizType]}
 				<div class="widget-wrapper">
-					<Comp {widget} records={widgetRecords} />
+					{#if widgetRecords.length > 0}
+						<Comp {widget} records={widgetRecords} />
+					{:else}
+						<div class="widget-loading">Loading...</div>
+					{/if}
+					<button class="widget-delete-btn" onclick={() => handleDeleteWidget(widget.id)} title="Remove widget">
+						<svg viewBox="0 0 12 12" width="10" height="10"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+					</button>
 				</div>
 			{:else}
 				<Card>
@@ -442,6 +454,41 @@
 		display: grid;
 		grid-template-columns: 1fr 1fr;
 		gap: 10px;
+	}
+
+	.widget-wrapper {
+		position: relative;
+	}
+	.widget-delete-btn {
+		position: absolute;
+		top: 8px;
+		right: 8px;
+		width: 22px;
+		height: 22px;
+		border-radius: 50%;
+		border: none;
+		background: var(--bg);
+		color: var(--text-tertiary);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		opacity: 0;
+		transition: opacity 0.2s;
+		z-index: 1;
+	}
+	.widget-wrapper:hover .widget-delete-btn { opacity: 1; }
+	.widget-loading {
+		background: var(--card);
+		border: 1px solid var(--border);
+		border-radius: 14px;
+		padding: 14px 16px;
+		min-height: 80px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 11px;
+		color: var(--text-tertiary);
 	}
 
 	.error-banner {

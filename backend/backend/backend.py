@@ -27,7 +27,9 @@ from flask_cors import CORS
 from openai import OpenAI
 
 HERE = Path(__file__).parent
-CSV_PATH = HERE / "week_health_data.csv"
+DATA_DIR = HERE / "new_data" / "person_sleep_issues"
+DAILY_CSV = DATA_DIR / "person_sleep_issues_daily.csv"
+SECONDLY_CSV = DATA_DIR / "person_sleep_issues_secondly.csv"
 load_dotenv(HERE / ".env")
 
 app = Flask(__name__)
@@ -48,10 +50,53 @@ def static_file(filename: str):
     abort(404, "Not found")
 
 # ---------- data load ----------
-print(f"Loading {CSV_PATH} ...")
-_df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
-_df = _df.set_index("timestamp").sort_index()
-print(f"Loaded {len(_df):,} rows from {_df.index[0]} to {_df.index[-1]}")
+# New layout: daily aggregates in *_daily.csv, high-res samples in *_secondly.csv.
+# For backward compatibility we expose a single seconds-indexed `_df` with the
+# same columns the old endpoints used by merging daily values onto midnight of
+# each day.
+print(f"Loading {SECONDLY_CSV} ...")
+_sec = pd.read_csv(SECONDLY_CSV, parse_dates=["timestamp"])
+_sec = _sec.set_index("timestamp").sort_index()
+print(f"  secondly: {len(_sec):,} rows from {_sec.index[0]} to {_sec.index[-1]}")
+
+print(f"Loading {DAILY_CSV} ...")
+_daily = pd.read_csv(DAILY_CSV, parse_dates=["date"])
+_daily = _daily.set_index("date").sort_index()
+print(f"  daily:    {len(_daily):,} rows from {_daily.index[0]} to {_daily.index[-1]}")
+
+# Pre-compute per-day heart-rate min/mean/max and spo2 mean from the seconds
+# data (the daily csv only has avg_heart_rate_bpm and min_spo2_pct).
+_hr_by_day = _sec["heart_rate_bpm"].groupby(_sec.index.normalize()).agg(["min", "mean", "max"])
+_spo2_mean_by_day = _sec["spo2_pct"].groupby(_sec.index.normalize()).mean()
+
+# Enriched daily frame used by /api/daily and /api/health/raw.
+_daily_df = _daily.copy()
+_daily_df["heart_rate_min"] = _hr_by_day["min"]
+_daily_df["heart_rate_mean"] = _hr_by_day["mean"].round(1)
+_daily_df["heart_rate_max"] = _hr_by_day["max"]
+_daily_df["spo2_mean"] = _spo2_mean_by_day.round(2)
+
+# Build the legacy seconds-indexed frame so old endpoints keep working.
+_df = _sec.copy()
+# Per-day aggregates are sparse columns that only carry a value at 00:00:00 of
+# the day they belong to — matches the original dataset's shape.
+_daily_to_legacy = {
+    "resting_hr_bpm": "resting_hr_bpm",
+    "hrv_rmssd_ms": "hrv_rmssd_ms",
+    "sleep_score": "sleep_score",
+    "weight_kg": "weight_kg",
+    "bp_systolic": "bp_systolic",
+    "bp_diastolic": "bp_diastolic",
+}
+for src_col, dst_col in _daily_to_legacy.items():
+    _df[dst_col] = pd.NA
+    for day, val in _daily[src_col].dropna().items():
+        ts = pd.Timestamp(day)
+        if ts in _df.index:
+            _df.at[ts, dst_col] = val
+    _df[dst_col] = pd.to_numeric(_df[dst_col], errors="coerce")
+
+print(f"Loaded {len(_df):,} legacy rows, columns={list(_df.columns)}")
 
 ALL_COLUMNS = list(_df.columns)
 COLUMN_ALIASES = {
@@ -184,9 +229,17 @@ def series(column: str):
     })
 
 
+def _opt_float(v):
+    return None if v is None or pd.isna(v) else float(v)
+
+
+def _opt_int(v):
+    return None if v is None or pd.isna(v) else int(v)
+
+
 @app.get("/api/daily")
 def daily():
-    """Summary for a single day."""
+    """Summary for a single day (reads pre-aggregated daily CSV)."""
     day_str = request.args.get("day")
     if not day_str:
         abort(400, "?day=YYYY-MM-DD required")
@@ -194,40 +247,32 @@ def daily():
         day = pd.to_datetime(day_str).normalize()
     except Exception:
         abort(400, "Bad day")
-    end = day + timedelta(days=1)
-    sub = _df.loc[day:end - timedelta(seconds=1)]
-    if sub.empty:
+    if day not in _daily_df.index:
         abort(404, "Day not in dataset")
-
-    weight = sub["weight_kg"].dropna()
-    sleep_score = sub["sleep_score"].dropna()
-    bp_sys = sub["bp_systolic"].dropna()
-    bp_dia = sub["bp_diastolic"].dropna()
-    rhr = sub["resting_hr_bpm"].dropna() if "resting_hr_bpm" in sub.columns else pd.Series(dtype=float)
-    hrv = sub["hrv_rmssd_ms"].dropna() if "hrv_rmssd_ms" in sub.columns else pd.Series(dtype=float)
+    r = _daily_df.loc[day]
+    bp_s, bp_d = _opt_int(r.get("bp_systolic")), _opt_int(r.get("bp_diastolic"))
 
     return jsonify({
         "day": day.strftime("%Y-%m-%d"),
-        "steps_total": int(sub["steps_today"].max()),
-        "calories_total": (
-            round(float(sub["calories_today"].max()), 1)
-            if "calories_today" in sub.columns else None
-        ),
+        "steps_total": _opt_int(r.get("steps_total")) or 0,
+        "calories_total": _opt_float(r.get("calories_total")),
         "heart_rate": {
-            "mean": round(float(sub["heart_rate_bpm"].mean()), 1),
-            "min": int(sub["heart_rate_bpm"].min()),
-            "max": int(sub["heart_rate_bpm"].max()),
+            "mean": round(float(r["heart_rate_mean"]), 1) if pd.notna(r.get("heart_rate_mean")) else None,
+            "min": _opt_int(r.get("heart_rate_min")),
+            "max": _opt_int(r.get("heart_rate_max")),
         },
-        "resting_hr": float(rhr.iloc[0]) if len(rhr) else None,
-        "hrv_rmssd_ms": float(hrv.iloc[0]) if len(hrv) else None,
-        "spo2_mean": round(float(sub["spo2_pct"].mean()), 2),
-        "workout_seconds": int(sub["workout_flag"].sum()),
-        "sleep_score": float(sleep_score.iloc[0]) if len(sleep_score) else None,
-        "weight_kg": float(weight.iloc[0]) if len(weight) else None,
-        "blood_pressure": (
-            f"{int(bp_sys.iloc[0])}/{int(bp_dia.iloc[0])}"
-            if len(bp_sys) and len(bp_dia) else None
-        ),
+        "resting_hr": _opt_float(r.get("resting_hr_bpm")),
+        "hrv_rmssd_ms": _opt_float(r.get("hrv_rmssd_ms")),
+        "spo2_mean": round(float(r["spo2_mean"]), 2) if pd.notna(r.get("spo2_mean")) else None,
+        "workout_seconds": int(round(float(r.get("workout_minutes") or 0) * 60)),
+        "sleep_score": _opt_float(r.get("sleep_score")),
+        "sleep_minutes": _opt_float(r.get("sleep_minutes")),
+        "deep_minutes": _opt_float(r.get("deep_minutes")),
+        "rem_minutes": _opt_float(r.get("rem_minutes")),
+        "light_minutes": _opt_float(r.get("light_minutes")),
+        "min_spo2_pct": _opt_float(r.get("min_spo2_pct")),
+        "weight_kg": _opt_float(r.get("weight_kg")),
+        "blood_pressure": f"{bp_s}/{bp_d}" if bp_s is not None and bp_d is not None else None,
     })
 
 
@@ -285,15 +330,20 @@ VIZ_TYPES = ["single_value", "line", "bar", "scatter", "area", "stacked_bar", "h
 
 AGENT_SYSTEM_PROMPT = """You are a health dashboard widget builder. Generate ONLY valid JSON — no markdown fences, no prose.
 
-AVAILABLE HEALTH DATA (array of daily records, field types & units):
+AVAILABLE HEALTH DATA (array of DAILY records — one row per day, already sorted by date ascending):
   date: string ("YYYY-MM-DD")
-  heart_rate_mean: number (bpm) — average heart rate for the day
-  heart_rate_min: number (bpm) — lowest heart rate
-  heart_rate_max: number (bpm) — highest heart rate
-  resting_hr: number|null (bpm) — morning resting heart rate (one reading per day, may be null)
-  hrv_ms: number|null (ms) — heart rate variability RMSSD (one reading per day, may be null)
-  spo2_mean: number (%) — average blood oxygen saturation
-  sleep_score: number|null (0-100) — sleep quality score (may be null)
+  heart_rate_mean: number|null (bpm) — average heart rate for the day
+  heart_rate_min: number|null (bpm) — lowest heart rate
+  heart_rate_max: number|null (bpm) — highest heart rate
+  resting_hr: number|null (bpm) — morning resting heart rate (may be null)
+  hrv_ms: number|null (ms) — heart rate variability RMSSD (may be null)
+  spo2_mean: number|null (%) — average blood oxygen saturation
+  min_spo2_pct: number|null (%) — lowest SpO2 sample of the day (often during sleep)
+  sleep_score: number|null (0-100) — overall sleep quality score (may be null)
+  sleep_minutes: number|null — total sleep duration in minutes (may be 0 on no-sleep days)
+  deep_minutes: number|null — minutes in deep sleep
+  rem_minutes: number|null — minutes in REM sleep
+  light_minutes: number|null — minutes in light sleep
   steps_total: number — total steps for the day
   calories_total: number|null — total calories burned (may be null)
   workout_minutes: number — total workout minutes for the day
@@ -301,80 +351,144 @@ AVAILABLE HEALTH DATA (array of daily records, field types & units):
   bp_systolic: number|null — systolic blood pressure (may be null)
   bp_diastolic: number|null — diastolic blood pressure (may be null)
 
-RULES:
-- Filter out null values before computing.
-- Handle empty arrays gracefully (return reasonable defaults like 0 or null).
-- computeFn must be a JS function body string: the body of a function(records) { ... }.
-- The function receives an array of HealthRecord objects and must return a ComputeResult.
+CRITICAL RULES:
+1. ALWAYS filter `null` and non-finite values before using a field: `records.filter(r => r.X != null && Number.isFinite(r.X))`.
+2. Records are already one-per-day. Do NOT group by date or deduplicate — each row is already a distinct day.
+3. For "weekly"/"7-day" type requests: use the last 7 records, e.g. `records.slice(-7)`.
+4. For "monthly" requests: group by year-month: `r.date.slice(0, 7)`.
+5. NEVER concatenate values — accumulate with `+=` or `reduce((a, b) => a + b, 0)`.
+6. Handle empty arrays — guard with `if (filtered.length === 0) return {...defaults}`.
+7. computeFn is the BODY of a `function(records) { ... }` — start with code, end with `return {...}`.
+8. Return value MUST match one of the result types below. The `kind` field is REQUIRED.
+9. For series results, x should be a meaningful label (date "YYYY-MM-DD", or category like "Mon"); y MUST be a finite number.
 
 COMPUTE RESULT TYPES:
 
-single_value: { kind: "single_value", value: number, unit: string, label: string, trend?: "up"|"down"|"flat", trendValue?: number }
-  Use for: single KPI metrics (e.g. average HRV, total steps, best sleep score).
+A) single_value:
+   { kind: "single_value", value: number, unit: string, label: string, trend?: "up"|"down"|"flat", trendValue?: number }
+   Use for: single KPIs (avg HRV, total steps, best sleep).
 
-series: { kind: "series", series: Array<{ x: string|number, y: number, label?: string }>, xLabel?: string, yLabel?: string, unit?: string }
-  Use for: trends over time, comparisons, distributions. Each entry in series has x (the label/date/category) and y (the value).
+B) series:
+   { kind: "series", series: [{ x: string|number, y: number, label?: string }], xLabel?: string, yLabel?: string, unit?: string }
+   Use for: trends, comparisons, distributions, correlations.
 
 VIZ TYPE GUIDE:
-- single_value: big number display — best for single metrics (avg HR, total steps, best sleep)
-- line: line chart — best for trends over time (HRV by day, resting HR trend)
-- bar: bar chart — best for comparing values across days (steps per day)
-- scatter: scatter plot — best for correlation (HRV vs sleep score, steps vs calories)
-- area: area chart — best for cumulative or range data
-- stacked_bar: stacked bars — best for composition
-- heatmap: grid of colored cells — best for week-at-a-glance patterns
+- single_value: one big number (e.g. "Average HRV this week")
+- line: trend over time — DATE x-axis (e.g. "HRV trend last 7 days")
+- area: cumulative/filled trend over time (e.g. "Steps over week")
+- bar: discrete comparison across days/categories (e.g. "Sleep score per day")
+- scatter: correlation between two NUMERIC fields — x AND y must be numbers (e.g. "HRV vs sleep score")
+- stacked_bar: composition breakdown (e.g. one segment per category)
+- heatmap: grid where x = row label, y = value, label = column label
 
-WIDGET JSON SCHEMA (respond with EXACTLY this shape):
+WORKED EXAMPLES (study these patterns carefully):
+
+# Example 1 — single_value (Average HRV last 7 days):
 {
-  "title": "string (≤5 words, concise)",
-  "description": "string (1 sentence explaining the metric)",
-  "vizType": "single_value | line | bar | scatter | area | stacked_bar | heatmap",
-  "computeFn": "string (JS function body, see rules above)"
+  "title": "Avg HRV (7d)",
+  "description": "Average heart rate variability over the past week.",
+  "vizType": "single_value",
+  "computeFn": "const recs = records.slice(-7).filter(r => r.hrv_ms != null && Number.isFinite(r.hrv_ms)); if (recs.length === 0) return { kind: 'single_value', value: 0, unit: 'ms', label: 'No data' }; const avg = recs.reduce((s, r) => s + r.hrv_ms, 0) / recs.length; const prev = records.slice(-14, -7).filter(r => r.hrv_ms != null); const prevAvg = prev.length ? prev.reduce((s, r) => s + r.hrv_ms, 0) / prev.length : avg; return { kind: 'single_value', value: Math.round(avg * 10) / 10, unit: 'ms', label: '7-day average', trend: avg > prevAvg ? 'up' : avg < prevAvg ? 'down' : 'flat', trendValue: Math.round((avg - prevAvg) * 10) / 10 };"
 }
 
-RETURN ONLY THE JSON OBJECT. No explanation, no markdown fences."""
+# Example 2 — line (HRV trend last 7 days):
+{
+  "title": "HRV Weekly Trend",
+  "description": "Heart rate variability over the past 7 days.",
+  "vizType": "line",
+  "computeFn": "const recs = records.slice(-7).filter(r => r.hrv_ms != null && Number.isFinite(r.hrv_ms)); return { kind: 'series', series: recs.map(r => ({ x: r.date, y: Math.round(r.hrv_ms * 10) / 10 })), xLabel: 'Date', yLabel: 'HRV', unit: 'ms' };"
+}
+
+# Example 3 — bar (Steps per day):
+{
+  "title": "Daily Steps",
+  "description": "Total steps per day over the past week.",
+  "vizType": "bar",
+  "computeFn": "const recs = records.slice(-7).filter(r => Number.isFinite(r.steps_total)); return { kind: 'series', series: recs.map(r => ({ x: r.date, y: r.steps_total })), xLabel: 'Date', yLabel: 'Steps', unit: 'steps' };"
+}
+
+# Example 4 — area (Sleep score trend):
+{
+  "title": "Sleep Score Trend",
+  "description": "Daily sleep quality score over the past 2 weeks.",
+  "vizType": "area",
+  "computeFn": "const recs = records.slice(-14).filter(r => r.sleep_score != null && Number.isFinite(r.sleep_score)); return { kind: 'series', series: recs.map(r => ({ x: r.date, y: Math.round(r.sleep_score) })), xLabel: 'Date', yLabel: 'Sleep score', unit: 'points' };"
+}
+
+# Example 5 — scatter (HRV vs sleep score):
+{
+  "title": "HRV vs Sleep Score",
+  "description": "Correlation between sleep quality and recovery.",
+  "vizType": "scatter",
+  "computeFn": "const recs = records.filter(r => r.hrv_ms != null && r.sleep_score != null && Number.isFinite(r.hrv_ms) && Number.isFinite(r.sleep_score)); return { kind: 'series', series: recs.map(r => ({ x: r.sleep_score, y: r.hrv_ms, label: r.date })), xLabel: 'Sleep score', yLabel: 'HRV (ms)', unit: 'ms' };"
+}
+
+# Example 6 — stacked_bar (Calorie split, illustrative):
+{
+  "title": "Last Day Composition",
+  "description": "Breakdown of the most recent day's calorie components.",
+  "vizType": "stacked_bar",
+  "computeFn": "const r = records[records.length - 1]; const total = (r.calories_total ?? 0); const workout = Math.round((r.workout_minutes / 60) * 400); const basal = Math.max(0, total - workout); return { kind: 'series', series: [{ x: 'Basal', y: basal, label: 'Basal' }, { x: 'Active', y: workout, label: 'Active' }], yLabel: 'kcal', unit: 'kcal' };"
+}
+
+# Example 7 — heatmap (sleep score by day-of-week × week):
+{
+  "title": "Sleep Heatmap",
+  "description": "Sleep score by day of week across recent weeks.",
+  "vizType": "heatmap",
+  "computeFn": "const recs = records.filter(r => r.sleep_score != null); const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']; const cells = recs.map(r => { const d = new Date(r.date); const wk = `W${Math.floor((d.getTime() - new Date(recs[0].date).getTime()) / (7*86400000)) + 1}`; return { x: wk, y: Math.round(r.sleep_score), label: days[d.getDay()] }; }); return { kind: 'series', series: cells, xLabel: 'Week', yLabel: 'Score', unit: 'points' };"
+}
+
+WIDGET JSON SCHEMA (respond with EXACTLY this shape, no extra keys):
+{
+  "title": "string (≤5 words)",
+  "description": "string (1 sentence)",
+  "vizType": "single_value | line | bar | scatter | area | stacked_bar | heatmap",
+  "computeFn": "string — JS function body"
+}
+
+RETURN ONLY THE JSON OBJECT. No explanation, no markdown fences, no commentary."""
+
+
+def _build_health_records(limit: int | None = None) -> list[dict]:
+    """Build HealthRecord[] from the pre-aggregated daily frame."""
+    df = _daily_df if limit is None else _daily_df.tail(limit)
+    records = []
+    for day, r in df.iterrows():
+        records.append({
+            "date": day.strftime("%Y-%m-%d"),
+            "heart_rate_mean": round(float(r["heart_rate_mean"]), 1) if pd.notna(r.get("heart_rate_mean")) else None,
+            "heart_rate_min": _opt_int(r.get("heart_rate_min")),
+            "heart_rate_max": _opt_int(r.get("heart_rate_max")),
+            "resting_hr": _opt_float(r.get("resting_hr_bpm")),
+            "hrv_ms": _opt_float(r.get("hrv_rmssd_ms")),
+            "spo2_mean": round(float(r["spo2_mean"]), 2) if pd.notna(r.get("spo2_mean")) else None,
+            "min_spo2_pct": _opt_float(r.get("min_spo2_pct")),
+            "sleep_score": _opt_float(r.get("sleep_score")),
+            "sleep_minutes": _opt_float(r.get("sleep_minutes")),
+            "deep_minutes": _opt_float(r.get("deep_minutes")),
+            "rem_minutes": _opt_float(r.get("rem_minutes")),
+            "light_minutes": _opt_float(r.get("light_minutes")),
+            "steps_total": _opt_int(r.get("steps_total")) or 0,
+            "calories_total": _opt_float(r.get("calories_total")),
+            "workout_minutes": _opt_float(r.get("workout_minutes")) or 0.0,
+            "weight_kg": _opt_float(r.get("weight_kg")),
+            "bp_systolic": _opt_int(r.get("bp_systolic")),
+            "bp_diastolic": _opt_int(r.get("bp_diastolic")),
+        })
+    return records
 
 
 def _get_sample_records() -> list[dict]:
-    """Build 2 sample HealthRecords for computeFn validation."""
-    dates = sorted(set(_df.index.normalize()))[:2]
-    records = []
-    for day in dates:
-        end_ts = day + timedelta(days=1)
-        sub = _df.loc[day:end_ts - timedelta(seconds=1)]
-        if sub.empty:
-            continue
-        rhr = sub["resting_hr_bpm"].dropna() if "resting_hr_bpm" in sub.columns else pd.Series(dtype=float)
-        hrv = sub["hrv_rmssd_ms"].dropna() if "hrv_rmssd_ms" in sub.columns else pd.Series(dtype=float)
-        cal = sub["calories_today"].dropna() if "calories_today" in sub.columns else pd.Series(dtype=float)
-        weight = sub["weight_kg"].dropna()
-        sleep_sc = sub["sleep_score"].dropna()
-        bp_s = sub["bp_systolic"].dropna()
-        bp_d = sub["bp_diastolic"].dropna()
-        records.append({
-            "date": day.strftime("%Y-%m-%d"),
-            "heart_rate_mean": round(float(sub["heart_rate_bpm"].mean()), 1),
-            "heart_rate_min": int(sub["heart_rate_bpm"].min()),
-            "heart_rate_max": int(sub["heart_rate_bpm"].max()),
-            "resting_hr": float(rhr.iloc[0]) if len(rhr) else None,
-            "hrv_ms": float(hrv.iloc[0]) if len(hrv) else None,
-            "spo2_mean": round(float(sub["spo2_pct"].mean()), 2),
-            "sleep_score": float(sleep_sc.iloc[0]) if len(sleep_sc) else None,
-            "steps_total": int(sub["steps_today"].max()),
-            "calories_total": round(float(cal.iloc[0]), 1) if len(cal) else None,
-            "workout_minutes": round(int(sub["workout_flag"].sum()) / 60, 1),
-            "weight_kg": float(weight.iloc[0]) if len(weight) else None,
-            "bp_systolic": int(bp_s.iloc[0]) if len(bp_s) else None,
-            "bp_diastolic": int(bp_d.iloc[0]) if len(bp_d) else None,
-        })
-    return records
+    """Build sample HealthRecords for computeFn validation (last 60 days)."""
+    return _build_health_records(limit=60)
 
 
 def _validate_fn_in_node(compute_fn: str, sample_records: list[dict]) -> tuple[bool, str | None, dict | None]:
     """Run computeFn in Node.js against sample data. Returns (ok, error_msg, result)."""
     # Escape computeFn for safe embedding in a Node one-liner.
     # Use JSON string to pass computeFn + records into Node.
-    payload = _json.dumps({"fn": compute_fn, "records": sample_records[:2]})
+    payload = _json.dumps({"fn": compute_fn, "records": sample_records})
     script = f"""
 const {{fn, records}} = JSON.parse({_json.dumps(payload)});
 try {{
@@ -383,8 +497,31 @@ try {{
   if (!result || typeof result !== 'object' || !result.kind) {{
     throw new Error('Result must be an object with a "kind" field');
   }}
-  if (result.kind !== 'single_value' && result.kind !== 'series') {{
-    throw new Error('kind must be "single_value" or "series"');
+  if (result.kind === 'single_value') {{
+    if (typeof result.value !== 'number' || !Number.isFinite(result.value)) {{
+      throw new Error('single_value.value must be a finite number (got ' + typeof result.value + ': ' + result.value + ')');
+    }}
+    if (typeof result.unit !== 'string') {{
+      throw new Error('single_value.unit must be a string');
+    }}
+  }} else if (result.kind === 'series') {{
+    if (!Array.isArray(result.series)) {{
+      throw new Error('series must be an array');
+    }}
+    if (result.series.length === 0) {{
+      throw new Error('series is empty — check your null filtering or use a larger window');
+    }}
+    const sample = result.series.slice(0, 5);
+    for (let i = 0; i < sample.length; i++) {{
+      const p = sample[i];
+      if (!p || typeof p !== 'object') throw new Error('series[' + i + '] is not an object');
+      if (p.x === undefined || p.x === null) throw new Error('series[' + i + '].x is missing');
+      if (typeof p.y !== 'number' || !Number.isFinite(p.y)) {{
+        throw new Error('series[' + i + '].y must be a finite number (got ' + typeof p.y + ': ' + JSON.stringify(p.y) + ')');
+      }}
+    }}
+  }} else {{
+    throw new Error('kind must be "single_value" or "series" (got ' + JSON.stringify(result.kind) + ')');
   }}
   console.log(JSON.stringify({{ok:true, result}}));
 }} catch(e) {{
@@ -427,37 +564,7 @@ def _strip_markdown_fences(raw: str) -> str:
 @app.get("/api/health/raw")
 def health_raw():
     """All daily summaries as HealthRecord[] — used by widget compute functions."""
-    dates = sorted(set(_df.index.normalize()))
-    records = []
-    for day in dates:
-        end_ts = day + timedelta(days=1)
-        sub = _df.loc[day:end_ts - timedelta(seconds=1)]
-        if sub.empty:
-            continue
-        rhr = sub["resting_hr_bpm"].dropna() if "resting_hr_bpm" in sub.columns else pd.Series(dtype=float)
-        hrv = sub["hrv_rmssd_ms"].dropna() if "hrv_rmssd_ms" in sub.columns else pd.Series(dtype=float)
-        cal = sub["calories_today"].dropna() if "calories_today" in sub.columns else pd.Series(dtype=float)
-        weight = sub["weight_kg"].dropna()
-        sleep_sc = sub["sleep_score"].dropna()
-        bp_s = sub["bp_systolic"].dropna()
-        bp_d = sub["bp_diastolic"].dropna()
-        records.append({
-            "date": day.strftime("%Y-%m-%d"),
-            "heart_rate_mean": round(float(sub["heart_rate_bpm"].mean()), 1),
-            "heart_rate_min": int(sub["heart_rate_bpm"].min()),
-            "heart_rate_max": int(sub["heart_rate_bpm"].max()),
-            "resting_hr": float(rhr.iloc[0]) if len(rhr) else None,
-            "hrv_ms": float(hrv.iloc[0]) if len(hrv) else None,
-            "spo2_mean": round(float(sub["spo2_pct"].mean()), 2),
-            "sleep_score": float(sleep_sc.iloc[0]) if len(sleep_sc) else None,
-            "steps_total": int(sub["steps_today"].max()),
-            "calories_total": round(float(cal.iloc[0]), 1) if len(cal) else None,
-            "workout_minutes": round(int(sub["workout_flag"].sum()) / 60, 1),
-            "weight_kg": float(weight.iloc[0]) if len(weight) else None,
-            "bp_systolic": int(bp_s.iloc[0]) if len(bp_s) else None,
-            "bp_diastolic": int(bp_d.iloc[0]) if len(bp_d) else None,
-        })
-    return jsonify({"records": records})
+    return jsonify({"records": _build_health_records()})
 
 
 @app.post("/api/agent")
@@ -482,12 +589,14 @@ def agent():
 
     last_error = None
     for attempt in range(max_retries + 1):
+        print(f"[agent] attempt {attempt + 1}/{max_retries + 1}, prompt={prompt[:80]!r}")
         resp = client.chat.completions.create(
             model="deepseek-v4-flash",
             messages=messages,
             temperature=0.3 if attempt == 0 else 0.5,
         )
         raw = resp.choices[0].message.content or ""
+        print(f"[agent] raw response ({len(raw)} chars): {raw[:300]!r}")
         raw = _strip_markdown_fences(raw)
 
         # Step 1 — JSON parse
@@ -495,6 +604,7 @@ def agent():
             widget = _json.loads(raw)
         except _json.JSONDecodeError as e:
             last_error = f"Invalid JSON: {e}"
+            print(f"[agent] JSON parse error: {e}")
             if attempt < max_retries:
                 messages.append({
                     "role": "user",
@@ -508,6 +618,7 @@ def agent():
         missing = [f for f in required if f not in widget or not widget[f]]
         if missing:
             last_error = f"Missing fields: {missing}"
+            print(f"[agent] missing fields: {missing}")
             if attempt < max_retries:
                 messages.append({
                     "role": "user",
@@ -519,6 +630,7 @@ def agent():
         # Step 3 — vizType check
         if widget["vizType"] not in VIZ_TYPES:
             last_error = f"Invalid vizType '{widget['vizType']}'"
+            print(f"[agent] invalid vizType: {widget['vizType']!r}")
             if attempt < max_retries:
                 messages.append({
                     "role": "user",
@@ -528,7 +640,9 @@ def agent():
             break
 
         # Step 4 — computeFn runtime check (Node.js)
+        print(f"[agent] computeFn ({len(widget['computeFn'])} chars):\n{widget['computeFn']}")
         fn_ok, fn_err, fn_result = _validate_fn_in_node(widget["computeFn"], sample_records)
+        print(f"[agent] node validation: ok={fn_ok}, err={fn_err!r}, result={str(fn_result)[:200]!r}")
         if not fn_ok:
             last_error = fn_err or "Unknown computeFn error"
             if attempt < max_retries:
@@ -549,6 +663,7 @@ def agent():
         widget["id"] = str(uuid.uuid4())
         widget["createdAt"] = datetime.utcnow().isoformat() + "Z"
         reply = f"Created '{widget['title']}': {widget['description']}"
+        print(f"[agent] success: {widget['title']!r} vizType={widget['vizType']!r}")
         return jsonify({"reply": reply, "widget": widget})
 
     # All retries exhausted or hard failure

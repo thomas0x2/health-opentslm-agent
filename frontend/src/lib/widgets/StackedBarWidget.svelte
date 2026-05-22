@@ -4,21 +4,28 @@
 
 	let { widget, records }: WidgetProps = $props();
 
-	let result = $state<SeriesResult | null>(null);
-	let error = $state('');
-
-	try {
-		const r = executeWidget(widget, records);
-		if (r.kind === 'series') result = r;
-		else error = `Expected series result, got ${r.kind}`;
-	} catch (e: any) {
-		error = e.message || String(e);
-	}
+	let execution = $derived.by(() => {
+		if (!records || records.length === 0) return { result: null as SeriesResult | null, error: '' };
+		try {
+			const r = executeWidget(widget, records);
+			if (r.kind === 'series') {
+				console.log(`[Widget "${widget.title}"] stacked, ${r.series.length} segments`);
+				return { result: r as SeriesResult, error: '' };
+			}
+			console.warn(`[Widget "${widget.title}"] wrong kind:`, r.kind);
+			return { result: null as SeriesResult | null, error: `Expected series result, got ${r.kind}` };
+		} catch (e: any) {
+			console.error(`[Widget "${widget.title}"] error:`, e.message || e);
+			return { result: null as SeriesResult | null, error: e.message || String(e) };
+		}
+	});
+	let result = $derived(execution.result);
+	let error = $derived(execution.error);
 
 	let segments = $derived((result?.series ?? []).filter(p => typeof p.y === 'number' && !isNaN(p.y)));
 	let total = $derived(segments.reduce((s, p) => s + p.y, 0) || 1);
 
-	const palette = ['var(--green)', 'var(--green-light, #4ade80)', 'var(--green-dark, #166534)', 'var(--text-primary)', 'var(--text-secondary)'];
+	const palette = ['var(--green)', 'var(--blue)', 'var(--terracotta)', 'var(--gold)', 'var(--purple)'];
 </script>
 
 <div class="widget-card">
