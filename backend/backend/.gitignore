@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+.hf_cache/
+indexes/
+papers/
+backend-server.*.log

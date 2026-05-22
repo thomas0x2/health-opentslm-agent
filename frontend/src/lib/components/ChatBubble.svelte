@@ -15,6 +15,7 @@
 		font-size: 13.5px;
 		line-height: 1.55;
 		color: var(--text-primary);
+		white-space: pre-line;
 	}
 	.bubble.agent {
 		background: var(--card);

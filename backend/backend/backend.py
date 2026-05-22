@@ -561,6 +561,45 @@ def _strip_markdown_fences(raw: str) -> str:
     return s
 
 
+def _fallback_widget(prompt: str, reason: str | None = None) -> dict:
+    """Local widget response used when the remote widget LLM is unavailable."""
+    p = prompt.lower()
+    if "sleep" in p:
+        widget = {
+            "title": "Sleep Trend",
+            "description": "Sleep score over the latest available days.",
+            "vizType": "line",
+            "computeFn": "const recs = records.filter(r => r.sleep_score != null && Number.isFinite(r.sleep_score)); if (recs.length === 0) return { kind: 'series', series: [], xLabel: 'Date', yLabel: 'Sleep score', unit: 'points' }; return { kind: 'series', series: recs.slice(-14).map(r => ({ x: r.date, y: Math.round(r.sleep_score) })), xLabel: 'Date', yLabel: 'Sleep score', unit: 'points' };",
+        }
+    elif "hrv" in p or "recovery" in p:
+        widget = {
+            "title": "HRV Average",
+            "description": "Average HRV over the latest week.",
+            "vizType": "single_value",
+            "computeFn": "const recs = records.slice(-7).filter(r => r.hrv_ms != null && Number.isFinite(r.hrv_ms)); if (recs.length === 0) return { kind: 'single_value', value: 0, unit: 'ms', label: 'No data' }; const avg = recs.reduce((s, r) => s + r.hrv_ms, 0) / recs.length; return { kind: 'single_value', value: Math.round(avg * 10) / 10, unit: 'ms', label: '7-day average' };",
+        }
+    elif "workout" in p or "training" in p or "strain" in p:
+        widget = {
+            "title": "Workout Minutes",
+            "description": "Daily workout minutes over the latest week.",
+            "vizType": "bar",
+            "computeFn": "const recs = records.slice(-7).filter(r => Number.isFinite(r.workout_minutes)); return { kind: 'series', series: recs.map(r => ({ x: r.date, y: Math.round(r.workout_minutes) })), xLabel: 'Date', yLabel: 'Workout minutes', unit: 'min' };",
+        }
+    else:
+        widget = {
+            "title": "Daily Steps",
+            "description": "Total steps over the latest week.",
+            "vizType": "bar",
+            "computeFn": "const recs = records.slice(-7).filter(r => Number.isFinite(r.steps_total)); return { kind: 'series', series: recs.map(r => ({ x: r.date, y: r.steps_total })), xLabel: 'Date', yLabel: 'Steps', unit: 'steps' };",
+        }
+    widget["id"] = str(uuid.uuid4())
+    widget["createdAt"] = datetime.utcnow().isoformat() + "Z"
+    reply = f"Created '{widget['title']}' locally: {widget['description']}"
+    if reason:
+        reply += f" Remote agent unavailable: {reason}"
+    return {"reply": reply, "widget": widget}
+
+
 @app.get("/api/health/raw")
 def health_raw():
     """All daily summaries as HealthRecord[] — used by widget compute functions."""
@@ -577,7 +616,7 @@ def agent():
 
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        abort(500, "DEEPSEEK_API_KEY not configured")
+        return jsonify(_fallback_widget(prompt, "DEEPSEEK_API_KEY not configured"))
 
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
     sample_records = _get_sample_records()
@@ -590,11 +629,15 @@ def agent():
     last_error = None
     for attempt in range(max_retries + 1):
         print(f"[agent] attempt {attempt + 1}/{max_retries + 1}, prompt={prompt[:80]!r}")
-        resp = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=messages,
-            temperature=0.3 if attempt == 0 else 0.5,
-        )
+        try:
+            resp = client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=messages,
+                temperature=0.3 if attempt == 0 else 0.5,
+            )
+        except Exception as e:
+            print(f"[agent] remote call failed, using local fallback: {e}")
+            return jsonify(_fallback_widget(prompt, str(e)))
         raw = resp.choices[0].message.content or ""
         print(f"[agent] raw response ({len(raw)} chars): {raw[:300]!r}")
         raw = _strip_markdown_fences(raw)
@@ -681,4 +724,6 @@ def _err(e):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="127.0.0.1", port=port, debug=True)
+    host = os.environ.get("HOST", "0.0.0.0")
+    debug = os.environ.get("FLASK_DEBUG", "0") in ("1", "true", "yes")
+    app.run(host=host, port=port, debug=debug, use_reloader=False)

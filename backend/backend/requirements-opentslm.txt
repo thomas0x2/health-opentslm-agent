@@ -1,0 +1,17 @@
+flask>=3.0
+flask-cors>=4.0
+pandas>=2.2
+numpy>=1.26
+python-dotenv>=1.0
+pydantic>=2.7
+tenacity>=8.5
+openai>=1.40
+anthropic>=0.40
+pypdf>=4.3
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+torch>=2.2
+transformers>=4.44
+accelerate>=0.33
+huggingface-hub>=0.24
+opentslm @ git+https://github.com/StanfordBDHG/OpenTSLM.git

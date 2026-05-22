@@ -1,9 +1,10 @@
 <script lang="ts">
-	interface Props { placeholder?: string; onSend?: (text: string) => void }
-	let { placeholder = 'Ask your health agent...', onSend }: Props = $props();
+	interface Props { placeholder?: string; disabled?: boolean; onSend?: (text: string) => void }
+	let { placeholder = 'Ask your health agent...', disabled = false, onSend }: Props = $props();
 	let inputValue = $state('');
 
 	function send() {
+		if (disabled) return;
 		const t = inputValue.trim();
 		if (!t) return;
 		onSend?.(t);
@@ -19,10 +20,11 @@
 		type="text"
 		class="chat-input"
 		{placeholder}
+		{disabled}
 		bind:value={inputValue}
 		onkeydown={onKeydown}
 	/>
-	<button class="send" aria-label="Send" onclick={send}>
+	<button class="send" aria-label="Send" onclick={send} {disabled}>
 		<svg viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
 	</button>
 </div>
@@ -49,6 +51,7 @@
 	}
 	.chat-input::placeholder { color: var(--text-tertiary); }
 	.chat-input:focus { border-color: var(--green); }
+	.chat-input:disabled { opacity: 0.65; cursor: wait; }
 	.send {
 		width: 40px;
 		height: 40px;
@@ -62,6 +65,7 @@
 		flex-shrink: 0;
 		transition: transform 0.15s;
 	}
+	.send:disabled { opacity: 0.65; cursor: wait; }
 	.send:active { transform: scale(0.92); }
 	.send svg {
 		width: 18px;

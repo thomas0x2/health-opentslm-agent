@@ -1,7 +1,21 @@
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:5000';
+function localApiBase(port: number) {
+	if (typeof window === 'undefined') return `http://127.0.0.1:${port}`;
+	return `${window.location.protocol}//${window.location.hostname}:${port}`;
+}
+
+const API_BASE = import.meta.env.VITE_API_BASE || localApiBase(5000);
+const AGENT_API_BASE = import.meta.env.VITE_AGENT_API_BASE || localApiBase(5001);
 
 async function api<T>(path: string, params?: Record<string, string | number | boolean | undefined>, init?: RequestInit): Promise<T> {
-	const url = new URL(path, API_BASE);
+	return request<T>(API_BASE, path, params, init);
+}
+
+async function agentApi<T>(path: string, params?: Record<string, string | number | boolean | undefined>, init?: RequestInit): Promise<T> {
+	return request<T>(AGENT_API_BASE, path, params, init);
+}
+
+async function request<T>(base: string, path: string, params?: Record<string, string | number | boolean | undefined>, init?: RequestInit): Promise<T> {
+	const url = new URL(path, base);
 	if (params) {
 		for (const [k, v] of Object.entries(params)) {
 			if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
@@ -105,6 +119,60 @@ export const sendAgentMessage = (prompt: string) =>
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ prompt }),
+	});
+
+export interface AgentDomain {
+	name: string;
+	title: string;
+	description: string;
+	advice_categories: string[];
+	score_fields: string[];
+	accepts_cross_domain_evidence: boolean;
+}
+
+export interface AdviceItem {
+	category: string;
+	headline: string;
+	rationale: string;
+	actionable_step: string;
+	citations?: { paper: string; page: number }[];
+	applies_to?: string | null;
+}
+
+export interface AdviceResponse {
+	domain: string;
+	agent_backend: string;
+	features: Record<string, any>;
+	narration?: Record<string, any> | null;
+	queries: string[];
+	retrieved_papers: { paper: string; page: number; snippet: string; score: number }[];
+	advice: {
+		summary: string;
+		advice?: AdviceItem[];
+		scores?: Record<string, number>;
+		flags?: {
+			name: string;
+			severity: string;
+			recommended_action: string;
+			urgency: string;
+		}[];
+		overall_severity?: number;
+		escalation_recommended?: boolean;
+		red_flags?: string[];
+		medical_disclaimer?: string;
+		caveats?: string[];
+	};
+	latency_ms: Record<string, number>;
+	window: { start: string; end: string };
+}
+
+export const getAgentDomains = () => agentApi<AgentDomain[]>('/api/agents');
+export const getHealthCoachAgents = () => agentApi<AgentDomain[]>('/api/agents');
+
+export const getAgentAdvice = (domain: string, opts?: { tone?: 'clinical' | 'coach'; includeOpenTslm?: boolean }) =>
+	agentApi<AdviceResponse>(`/api/agents/${domain}`, {
+		tone: opts?.tone,
+		include_opentslm: opts?.includeOpenTslm === false ? '0' : '1'
 	});
 
 export interface HealthRawResponse {
