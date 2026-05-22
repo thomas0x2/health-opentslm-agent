@@ -1,0 +1,65 @@
+:root {
+	--bg: #f4f0eb;
+	--bg-warm: #ede8e1;
+	--card: #ffffff;
+	--card-alt: #faf8f5;
+	--text-primary: #1a1a1a;
+	--text-secondary: #7a7570;
+	--text-tertiary: #a8a29e;
+	--border: #e8e2db;
+	--green: #2d5a3d;
+	--green-light: #e8f0eb;
+	--green-bg: #d4e6da;
+	--terracotta: #c45c3e;
+	--terracotta-light: #f5e8e3;
+	--blue: #3a5ba0;
+	--blue-light: #e4eaf4;
+	--gold: #8b6914;
+	--gold-light: #f5edda;
+	--purple: #6b4c8a;
+	--purple-light: #ede4f4;
+	--shadow-sm: 0 1px 3px rgba(26, 26, 26, 0.04);
+	--shadow-md: 0 4px 12px rgba(26, 26, 26, 0.06);
+	--shadow-lg: 0 8px 30px rgba(26, 26, 26, 0.08);
+	--radius-sm: 10px;
+	--radius-md: 14px;
+	--radius-lg: 20px;
+}
+
+*,
+*::before,
+*::after {
+	margin: 0;
+	padding: 0;
+	box-sizing: border-box;
+	-webkit-tap-highlight-color: transparent;
+}
+
+body {
+	font-family: 'DM Sans', sans-serif;
+	background: var(--bg);
+	color: var(--text-primary);
+	max-width: 430px;
+	margin: 0 auto;
+	min-height: 100vh;
+	overflow-x: hidden;
+	position: relative;
+}
+
+::-webkit-scrollbar {
+	width: 0;
+}
+
+.serif {
+	font-family: 'Instrument Serif', serif;
+}
+
+@keyframes fadeIn {
+	from { opacity: 0; transform: translateY(6px); }
+	to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+	0%, 100% { opacity: 1; }
+	50%       { opacity: 0.4; }
+}
